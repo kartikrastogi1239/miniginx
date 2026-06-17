@@ -161,7 +161,7 @@ Connection::ReadResult Connection::read(std::size_t max_bytes) {
     // 4096 bytes is a common choice because it matches one memory page,
     // which often aligns with how the kernel delivers data to us.
     // The caller can override max_bytes for larger or smaller reads.
-    std::vector<std::byte> buf(max_bytes);
+    std::vector<uint8_t> buf(max_bytes);
 
     // ------------------------------------------------------------------
     // The actual recv() call.
@@ -280,7 +280,7 @@ Connection::ReadResult Connection::readUntil(
         };
     }
 
-    std::vector<std::byte> accumulated;
+    std::vector<uint8_t> accumulated;
     accumulated.reserve(4096);  // reasonable initial allocation
 
     while (accumulated.size() < max_bytes) {
@@ -395,7 +395,7 @@ Connection::ReadResult Connection::readUntil(
 //                  Without this, a closed-peer write would kill the process.
 //                  With this, send() returns -1 / errno=EPIPE instead.
 // ============================================================================
-Connection::WriteResult Connection::write(const std::vector<std::byte>& data) {
+Connection::WriteResult Connection::write(const std::vector<uint8_t>& data) {
 
     if (state_ != State::Connected) {
         return WriteResult{
@@ -410,7 +410,7 @@ Connection::WriteResult Connection::write(const std::vector<std::byte>& data) {
     }
 
     std::size_t total_sent = 0;
-    const std::byte* ptr   = data.data();
+    const uint8_t* ptr   = data.data();
     std::size_t remaining  = data.size();
 
     // ------------------------------------------------------------------
@@ -498,10 +498,10 @@ Connection::WriteResult Connection::write(std::string_view data) {
     // Reinterpret the char* as std::byte* - this reinterpret_cast is
     // explicitly permitted by the C++ standard for std::byte (which is
     // designed as a "bag of bits" type).
-    const std::byte* begin = reinterpret_cast<const std::byte*>(data.data());
-    const std::byte* end   = begin + data.size();
+    const uint8_t* begin = reinterpret_cast<const uint8_t*>(data.data());
+    const uint8_t* end   = begin + data.size();
 
-    return write(std::vector<std::byte>(begin, end));
+    return write(std::vector<uint8_t>(begin, end));
 }
 
 }  // namespace miniginx::net

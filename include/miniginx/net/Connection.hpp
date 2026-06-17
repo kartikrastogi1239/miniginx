@@ -6,6 +6,8 @@
 #include <vector>
 #include <cstdint>
 #include <optional>
+#include <cstddef>
+
 
 namespace miniginx::net {
 
@@ -152,7 +154,7 @@ public:
     // "did the peer close?" vs "did I get data?" vs "error?".
     // ------------------------------------------------------------------
     struct ReadResult {
-        std::vector<std::byte> data;  // bytes received (may be empty)
+        std::vector<uint8_t> data;  // bytes received (may be empty)
         bool peer_closed = false;     // true if recv() returned 0 (EOF)
         bool ok = true;               // false if a syscall error occurred
         std::string error_message;    // set when ok == false
@@ -250,7 +252,7 @@ public:
     // On failure, bytes_sent indicates how many bytes were sent before
     // the error.
     // ------------------------------------------------------------------
-    [[nodiscard]] WriteResult write(const std::vector<std::byte>& data);
+    [[nodiscard]] WriteResult write(const std::vector<uint8_t>& data);
 
     // ------------------------------------------------------------------
     // write(string): convenience overload - sends a string (e.g. a raw

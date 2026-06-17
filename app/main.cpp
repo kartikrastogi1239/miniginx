@@ -1,97 +1,178 @@
 // =============================================================================
-// Mini Nginx - Phase 1: Networking Foundation Demo
+// Mini Nginx - Phase 2: Connection Abstraction Demo
 //
-// This program demonstrates the bare-bones TCP server lifecycle using the
-// RAII Socket / ServerSocket classes from miniginx::net.
+// This phase builds directly on the Phase 1 ServerSocket / Socket foundation
+// and demonstrates the Connection class with realistic I/O.
 //
-// What it does:
-//   1. Creates a listening socket on port 8080 (socket + bind + listen,
-//      all handled inside ServerSocket's constructor).
-//   2. Repeatedly:
-//        - Blocks in accept() until a client connects.
-//        - Prints the client's IP address.
-//        - Immediately closes that connection (no HTTP, no data exchange
-//          yet - that comes in later phases).
+// What this server does:
+//   1. Listens on port 8080.
+//   2. For each client connection:
+//      a. Reads everything the client sends (until \r\n\r\n or EOF).
+//         This mimics the first step of HTTP - without any actual HTTP
+//         parsing yet, just raw byte accumulation.
+//      b. Prints the raw request bytes to stdout.
+//      c. Sends a plain-text "acknowledgement" response back.
+//      d. Connection's destructor closes the fd when the scope ends.
 //
-// No epoll, no threads, no HTTP parsing. Purely: can we accept TCP
-// connections safely and cleanly using RAII?
+// Key behaviors demonstrated:
+//   - Connection owns the client socket (RAII): no explicit close() needed.
+//   - readUntil() hides the recv() loop and partial-read handling.
+//   - write() hides the send() loop and partial-write handling.
+//   - ReadResult / WriteResult make error checking explicit and readable.
+//   - Printing the connection state before and after shows the lifecycle.
 //
-// Try it out:
+// Try it:
 //   $ ./miniginx
-//   Mini Nginx listening on port 8080 (Ctrl+C to stop)...
 //
-//   # in another terminal:
-//   $ curl http://127.0.0.1:8080/
-//   (curl will see the connection close immediately with no response -
-//    that's expected at this phase)
-//
+//   $ curl -v http://127.0.0.1:8080/hello
+//   $ echo "Hello server" | nc 127.0.0.1 8080
 //   $ telnet 127.0.0.1 8080
-//   (connects, then is immediately disconnected by the server)
+//     (type some text, then press Enter twice)
 // =============================================================================
 
 #include "miniginx/net/ServerSocket.hpp"
+#include "miniginx/net/Connection.hpp"
 
 #include <iostream>
+#include <string>
+#include <string_view>
 #include <exception>
 
+// ---------------------------------------------------------------------------
+// handleClient()
+//
+// Called once per accepted client. Receives the connection by move (not copy)
+// so Connection uniquely owns the client fd for the duration of this function.
+// When the function returns, `conn` is destroyed and the fd is closed.
+//
+// Separated from main() for clarity - in later phases this becomes a method
+// on a Connection or Worker class.
+// ---------------------------------------------------------------------------
+void handleClient(miniginx::net::Connection conn) {
+
+    std::cout << "\n[+] Client connected: " << conn.peerIp()
+              << "  (fd=" << conn.fd() << ")\n";
+
+    // -----------------------------------------------------------------------
+    // Phase 1 of reading from a TCP client: readUntil("\r\n\r\n")
+    //
+    // We read until the HTTP-style double-CRLF header terminator, or
+    // until the client closes, or until we hit our 64KB safety cap.
+    //
+    // WHY "\r\n\r\n"?
+    // Even though we aren't doing HTTP parsing yet, real HTTP clients
+    // (curl, browsers, telnet) send requests ending with \r\n\r\n. Using
+    // this delimiter means our server gracefully handles real HTTP requests
+    // in this phase and appears to accept them before sending its reply.
+    //
+    // For a plain `nc` or `telnet` client that doesn't send the HTTP
+    // terminator, we handle the peer_closed path below.
+    // -----------------------------------------------------------------------
+    auto result = conn.readUntil("\r\n\r\n", 65536);
+
+    // -----------------------------------------------------------------------
+    // Interpret the ReadResult and decide what to do next.
+    //
+    // This structured check is the "check every result" pattern that
+    // MSG_NOSIGNAL + ReadResult / WriteResult structs enforce. Without these
+    // structs, it's easy to skip the peer_closed check and build half-baked
+    // responses.
+    // -----------------------------------------------------------------------
+
+    if (!result.ok) {
+        std::cout << "[-] Read error from " << conn.peerIp()
+                  << ": " << result.error_message << "\n";
+        return;
+    }
+
+    if (result.peer_closed && result.data.empty()) {
+        std::cout << "[-] " << conn.peerIp()
+                  << " closed connection without sending data.\n";
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Print what we received (as text, for demo purposes).
+    // -----------------------------------------------------------------------
+    std::string_view raw_data(
+        reinterpret_cast<const char*>(result.data.data()),
+        result.data.size());
+
+    std::cout << "[<] Received " << result.data.size()
+              << " bytes from " << conn.peerIp() << ":\n"
+              << "--- BEGIN ---\n"
+              << raw_data
+              << "\n--- END ---\n";
+
+    if (result.peer_closed) {
+        std::cout << "    (peer closed after sending the above)\n";
+    }
+
+    // -----------------------------------------------------------------------
+    // Build and send a response.
+    //
+    // This is a deliberately minimal plain-text response. It has just enough
+    // HTTP framing that `curl -v` won't error out: a status line, a couple of
+    // headers, and a body. The HTTP parser phase will generate proper
+    // responses with full header parsing.
+    // -----------------------------------------------------------------------
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Connection: close\r\n"
+        "Content-Length: 38\r\n"
+        "\r\n"
+        "Hello from Mini Nginx (Phase 2)!\r\n"
+        "\r\n";
+
+    auto write_result = conn.write(response);
+
+    if (!write_result.ok) {
+        std::cout << "[-] Write error to " << conn.peerIp()
+                  << ": " << write_result.error_message
+                  << " (sent " << write_result.bytes_sent << " bytes)\n";
+    } else {
+        std::cout << "[>] Sent " << write_result.bytes_sent
+                  << " bytes to " << conn.peerIp() << "\n";
+    }
+
+    // -----------------------------------------------------------------------
+    // conn goes out of scope here.
+    // ~Connection() -> Socket::~Socket() -> ::close(fd_)
+    // TCP FIN sent. No explicit close() call needed anywhere.
+    // -----------------------------------------------------------------------
+    std::cout << "[-] Connection to " << conn.peerIp()
+              << " closed (fd destroyed)\n";
+}
+
+
+// ---------------------------------------------------------------------------
+// main()
+// ---------------------------------------------------------------------------
 int main() {
     constexpr uint16_t kPort = 8080;
 
     try {
-        // ------------------------------------------------------------
-        // Construct the listening socket.
-        //
-        // By the time this constructor returns successfully, the
-        // server is fully bound to 0.0.0.0:8080 and listening - i.e.
-        // the OS will already accept TCP handshakes on this port, even
-        // before we call accept() for the first time.
-        //
-        // If construction fails (port in use, permission denied for
-        // privileged ports, etc.), it throws std::runtime_error, which
-        // we catch below and report.
-        // ------------------------------------------------------------
         miniginx::net::ServerSocket server(kPort);
 
-        std::cout << "Mini Nginx listening on port " << kPort
-                  << " (Ctrl+C to stop)...\n";
+        std::cout << "==============================================\n"
+                  << "  Mini Nginx - Phase 2: Connection Abstraction\n"
+                  << "  Listening on port " << kPort << "\n"
+                  << "  Try: curl http://127.0.0.1:" << kPort << "/\n"
+                  << "  Try: echo 'hi' | nc 127.0.0.1 " << kPort << "\n"
+                  << "==============================================\n\n";
 
-        // ------------------------------------------------------------
-        // Main accept loop.
-        //
-        // Each iteration:
-        //   - server.accept() BLOCKS until a client connects, then
-        //     returns:
-        //       * a Socket owning the new connection's fd
-        //       * the client's IP address as a string
-        //
-        //   - We print the IP.
-        //
-        //   - `client` (the Socket) goes out of scope at the end of
-        //     the loop body, so its destructor runs immediately -
-        //     calling close() on the connection's fd. This is the
-        //     "immediately close the connection" behavior requested
-        //     for this phase, achieved purely through RAII: there is
-        //     no explicit close() call anywhere in this function.
-        //
-        // The listening socket itself (`server`) is NEVER closed by
-        // this loop - it keeps accepting new clients indefinitely
-        // until the program exits, at which point ITS destructor
-        // closes the listening fd too.
-        // ------------------------------------------------------------
         while (true) {
-            auto [client, client_ip] = server.accept();
+            auto [client_socket, client_ip] = server.accept();
 
-            std::cout << "Accepted connection from " << client_ip << "\n";
+            miniginx::net::Connection conn(
+                std::move(client_socket),
+                client_ip);
 
-            // `client` is destroyed here (end of loop body scope),
-            // which closes its fd via Socket's destructor.
-            std::cout << "Closing connection from " << client_ip << "\n";
+            handleClient(std::move(conn));
         }
 
     } catch (const std::exception& ex) {
-        // Any failure in ServerSocket's constructor (socket/setsockopt/
-        // bind/listen) or in accept() lands here. We report it and exit
-        // with a non-zero status.
         std::cerr << "Fatal error: " << ex.what() << "\n";
         return 1;
     }
